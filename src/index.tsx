@@ -3,6 +3,9 @@
 import type { Message, Part } from "@opencode-ai/sdk/v2"
 import type { Renderable, TuiPluginApi, TuiPluginMeta, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { createMemo, createSignal, type Accessor } from "solid-js"
+import fs from "node:fs"
+import path from "node:path"
+import os from "node:os"
 
 type PinRecord = {
   sessionID: string
@@ -28,6 +31,69 @@ function getPins(api: TuiPluginApi, sessionID: string) {
 
 function setPins(api: TuiPluginApi, sessionID: string, pins: PinRecord[]) {
   api.kv.set(pinKey(sessionID), pins)
+}
+
+const PINS_KEY_PREFIX = `${PLUGIN_ID}.pins.`
+
+function opencodeStateDir(): string {
+  const xdg = process.env.XDG_STATE_HOME ?? path.join(os.homedir(), ".local", "state")
+  return path.join(xdg, "opencode")
+}
+
+function sessionJsonPath(): string {
+  return path.join(opencodeStateDir(), "session.json")
+}
+
+function kvJsonPath(): string {
+  return path.join(opencodeStateDir(), "kv.json")
+}
+
+// Read the built-in session pin list (toggled via /sessions Ctrl+F).
+// Stored by the TUI in session.json as { pinned: string[] }; read once at
+// startup and never re-read by the TUI, so we watch the file for live changes.
+function readPinnedSessions(): Set<string> {
+  try {
+    const raw = fs.readFileSync(sessionJsonPath(), "utf8")
+    const parsed = JSON.parse(raw) as unknown
+    if (parsed && typeof parsed === "object" && Array.isArray((parsed as { pinned?: unknown }).pinned)) {
+      return new Set(
+        (parsed as { pinned: unknown[] }).pinned.filter((x): x is string => typeof x === "string"),
+      )
+    }
+    return new Set()
+  } catch {
+    return new Set()
+  }
+}
+
+// Best-effort scan of the plugin KV file to find every session that currently
+// has message pins. api.kv cannot enumerate keys, so we read the backing file
+// directly. Used only at startup to reconcile pins against session pin state
+// (compensates for fs.watch events missed while the plugin was unloaded).
+function readSessionsWithPins(): string[] {
+  try {
+    const raw = fs.readFileSync(kvJsonPath(), "utf8")
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    return Object.keys(parsed)
+      .filter((key) => key.startsWith(PINS_KEY_PREFIX))
+      .map((key) => key.slice(PINS_KEY_PREFIX.length))
+      .filter((id) => id.length > 0)
+  } catch {
+    return []
+  }
+}
+
+// "session pin 为准": any session that is NOT in the built-in pinned list must
+// have its message pins cleared. Called once at startup.
+function reconcileStartupPins(api: TuiPluginApi, pinnedSessions: Set<string>, refreshPins: () => void) {
+  let changed = false
+  for (const sessionID of readSessionsWithPins()) {
+    if (!pinnedSessions.has(sessionID)) {
+      setPins(api, sessionID, [])
+      changed = true
+    }
+  }
+  if (changed) refreshPins()
 }
 
 function getActiveSessionID(api: TuiPluginApi): string | undefined {
@@ -273,6 +339,39 @@ async function tui(api: TuiPluginApi, options?: PinOption, meta?: TuiPluginMeta)
   api.event.on("message.removed", () => refreshPins())
   api.event.on("session.updated", () => refreshPins())
 
+  // session pin 为准: cache the built-in pinned-session set and keep it in sync
+  // with session.json. The TUI writes session.json on every Ctrl+F toggle, so
+  // watching the file lets us react to pin/unpin without a public API.
+  let pinnedSessionsCache = readPinnedSessions()
+  reconcileStartupPins(api, pinnedSessionsCache, refreshPins)
+
+  let watchTimer: ReturnType<typeof setTimeout> | undefined
+  try {
+    fs.watch(opencodeStateDir(), () => {
+      // Don't filter by filename — OpenCode embeds Bun, whose fs.watch does
+      // NOT emit a "session.json" event for atomic-rename writes (it only
+      // fires for the temp file). Always re-read and diff; the debounce +
+      // diff guard makes this safe even when triggered by kv.json or others.
+      clearTimeout(watchTimer)
+      watchTimer = setTimeout(() => {
+        const prev = pinnedSessionsCache
+        pinnedSessionsCache = readPinnedSessions()
+        // A session that left the pinned list was just unpinned (or pruned):
+        // clear its message pins. Pinning a session does nothing to pins.
+        let changed = false
+        for (const sessionID of prev) {
+          if (!pinnedSessionsCache.has(sessionID)) {
+            setPins(api, sessionID, [])
+            changed = true
+          }
+        }
+        if (changed) refreshPins()
+      }, 100)
+    })
+  } catch {
+    // session.json watch unavailable; rely on startup reconcile only
+  }
+
   api.slots.register({
     order: 900,
     slots: {
@@ -297,6 +396,13 @@ async function tui(api: TuiPluginApi, options?: PinOption, meta?: TuiPluginMeta)
           const sessionID = getActiveSessionID(api)
           if (!sessionID) {
             api.ui.toast({ variant: "warning", message: "Open a session before pinning a message." })
+            return
+          }
+          if (!pinnedSessionsCache.has(sessionID)) {
+            api.ui.toast({
+              variant: "warning",
+              message: "This session isn't pinned. Pin it via /sessions (Ctrl+F) first.",
+            })
             return
           }
           openPinDialog(api, sessionID, refreshPins)
